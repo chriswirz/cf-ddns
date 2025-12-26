@@ -1,0 +1,88 @@
+# GoReleaser configuration for cf-ddns.
+# https://goreleaser.com
+version: 2
+
+# Pinned rather than inferred. The asset names install.sh and the Dockerfile
+# fetch (cf-ddns-linux-amd64) are built from this, so it must not follow the
+# name of whatever directory the build happens to run in.
+project_name: cf-ddns
+
+builds:
+  - id: cf-ddns
+    main: ./cmd/cf-ddns
+    binary: cf-ddns
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - linux
+      - darwin
+      - windows
+      - freebsd
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ignore:
+      # 32-bit ARM only matters for Linux boards such as a Raspberry Pi.
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+      - goos: freebsd
+        goarch: arm
+      - goos: freebsd
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    # Ship the pieces someone needs to install it as a service.
+    files:
+      - README.md
+      - LICENSE
+      - config.example.json
+      - src: packaging/**/*
+        dst: packaging
+
+  # Bare, unversioned binaries alongside the archives. The name has to be
+  # stable for /releases/latest/download/<name> to resolve, which is what a
+  # Dockerfile or a one-line curl install needs: they cannot know the version
+  # in advance, so they cannot name a file that has the version in it.
+  - id: binary
+    formats: [binary]
+    name_template: '{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}'
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: '{{ incpatch .Version }}-next'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: false
+  prerelease: auto

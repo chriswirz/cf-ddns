@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+# One run at a time per branch, so two quick pushes to main cannot tag and
+# release concurrently. Superseded pull request runs are cancelled; a run on
+# main is not, because cancelling it partway could leave a tag with no
+# release attached to it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        # Windows runners default to PowerShell, which splits an unquoted
+        # -coverprofile=coverage.out into two arguments and leaves go trying to
+        # build a package called ".out". Bash is present on every runner and
+        # keeps one script working on all three.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+          cache: true
+
+      - name: Check formatting
+        if: runner.os != 'Windows'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race)
+        if: runner.os != 'Windows'
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+
+  cross-compile:
+    name: Cross-compile every target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+          cache: true
+      - name: Build all targets
+        run: ./build.sh --all
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cf-ddns-snapshot
+          path: dist/*
+          if-no-files-found: error
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned rather than "latest": a new linter release should not be
+          # able to fail CI on a commit that did not change anything.
+          version: v2.12
+
+  tidy:
+    name: go mod tidy is clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+      - run: go mod tidy
+      - name: Ensure no changes
+        run: git diff --exit-code
+
+      # This repository is developed on Windows, where core.fileMode is off and
+      # a chmod does not reach the index, so a new script arrives as 100644 and
+      # CI fails with "Permission denied" only once it tries to run it.
+      - name: Shell scripts are executable
+        run: |
+          status=0
+          for f in build.sh install.sh packaging/scripts/*.sh; do
+            if [ ! -x "$f" ]; then
+              echo "$f is not executable. Fix with: git update-index --chmod=+x $f"
+              status=1
+            fi
+          done
+          exit $status
+
+  # Everything below only runs on a push to the default branch, never on a
+  # pull request, and only once every check above has passed.
+  tag:
+    name: Tag the build
+    needs: [test, cross-compile, lint, tidy]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute the version
+        id: version
+        run: |
+          # run_number increases by one per run of this workflow and never
+          # repeats, which is what a build number needs to be. It counts pull
+          # request runs too, so released numbers have gaps; they stay in
+          # order, which is the part that matters.
+          build=$(printf '%04d' "${{ github.run_number }}")
+          echo "tag=v0.1.${build}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG already exists, leaving it alone"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "cf-ddns $TAG"
+          git push origin "$TAG"
+
+  release:
+    name: Release
+    needs: tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}

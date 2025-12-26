@@ -1,0 +1,153 @@
+# nginx with cf-ddns in the same container, so the name the site is served on
+# keeps pointing at this host's public IP.
+#
+#   cp .env.example .env     # then set CF_API_TOKEN and CF_DDNS_RECORDS
+#   docker compose up -d
+#
+# The two processes belong together here: a web server on a dynamic address is
+# only reachable while its DNS record is current, so neither half is much use
+# without the other. Running them as one unit means one restart policy and one
+# health check covering both.
+
+services:
+  webserver:
+    build:
+      args:
+        CF_DDNS_RELEASE: ${CF_DDNS_RELEASE:-latest}
+      dockerfile_inline: |
+        # syntax=docker/dockerfile:1
+        # nginx:latest is Debian. Pin the tag in anything you rely on: latest
+        # moves under you, and a new nginx major is not a change you want to
+        # discover from a restart.
+        FROM nginx:latest
+        # procps is only here for the pgrep in the health check.
+        RUN apt-get update \
+         && apt-get install -y --no-install-recommends ca-certificates curl procps \
+         && rm -rf /var/lib/apt/lists/*
+        ARG CF_DDNS_RELEASE=latest
+        # Only CF_DDNS_RELEASE appears below, and that is deliberate: Docker
+        # substitutes every $var on a RUN line before the shell sees it, and any
+        # name that is not a build arg becomes an empty string. Shell variables
+        # here would silently vanish and curl would be handed an empty URL.
+        # The two URL shapes are spelled out because GitHub words them
+        # differently: latest/download/<asset> against download/<tag>/<asset>.
+        # Both point at the unversioned binary the release publishes alongside
+        # the archives, because a URL cannot name a file whose name contains a
+        # version it does not yet know.
+        # On a Pi or Graviton, change linux-amd64 to linux-arm64 in both lines.
+        RUN set -eu; \
+            if [ -z "${CF_DDNS_RELEASE}" ] || [ "${CF_DDNS_RELEASE}" = "latest" ]; then \
+              curl -fsSL -o /usr/local/bin/cf-ddns \
+                "https://github.com/chriswirz/cf-ddns/releases/latest/download/cf-ddns-linux-amd64"; \
+            else \
+              curl -fsSL -o /usr/local/bin/cf-ddns \
+                "https://github.com/chriswirz/cf-ddns/releases/download/${CF_DDNS_RELEASE}/cf-ddns-linux-amd64"; \
+            fi; \
+            chmod +x /usr/local/bin/cf-ddns
+
+        # A health endpoint on its own port, so the check does not depend on
+        # whatever server block the real site ends up using, or on a Host header.
+        RUN cat > /etc/nginx/conf.d/healthz.conf <<'CONF'
+        server {
+            listen 8080;
+            location = /healthz {
+                access_log off;
+                add_header Content-Type text/plain;
+                return 200 "ok\n";
+            }
+        }
+        CONF
+
+        RUN cat > /entrypoint.sh <<'SH' && chmod +x /entrypoint.sh
+        #!/bin/sh
+        set -eu
+
+        # cf-ddns reads the API token straight from CF_API_TOKEN, so the secret
+        # never has to be written to disk. Everything else comes from a config
+        # file, generated once and then left alone, so an edit inside the volume
+        # survives a restart. It has to be on a volume rather than in the image
+        # because cf-ddns writes to it: with an empty records list it fills in a
+        # possible_records section listing what the token can see.
+        conf=/data/config.json
+        if [ ! -f "\$conf" ]; then
+          mkdir -p /data
+          records=''
+          IFS=,
+          for name in \${CF_DDNS_RECORDS:-}; do
+            name=\$(printf '%s' "\$name" | tr -d ' ')
+            [ -n "\$name" ] || continue
+            records="\${records}\${records:+,}"
+            records="\${records}{\"name\":\"\$name\",\"type\":\"\${CF_DDNS_TYPE:-A}\",\"proxied\":\${CF_DDNS_PROXIED:-false}}"
+          done
+          unset IFS
+          printf '{\n  "interval_seconds": %s,\n  "records": [%s]\n}\n' \
+            "\${CF_DDNS_INTERVAL:-300}" "\$records" > "\$conf"
+          echo "cf-ddns: wrote \$conf"
+        fi
+
+        # An empty records list is not a failure: cf-ddns lists what the token
+        # can see into possible_records and exits, so say where to look.
+        if [ -z "\${CF_DDNS_RECORDS:-}" ]; then
+          echo "cf-ddns: CF_DDNS_RECORDS is empty; it will write possible_records to \$conf"
+        fi
+
+        verbose=''
+        if [ "\${CF_DDNS_VERBOSE:-false}" = "true" ]; then
+          verbose='--verbose'
+        fi
+
+        cf-ddns --config "\$conf" \$verbose &
+        ddns=\$!
+
+        nginx -g 'daemon off;' &
+        web=\$!
+
+        # Stop both if either one stops. Neither is any use on its own, and
+        # exiting lets the restart policy bring up a clean pair.
+        trap 'kill -TERM "\$ddns" "\$web" 2>/dev/null || true' INT TERM
+        while kill -0 "\$ddns" 2>/dev/null && kill -0 "\$web" 2>/dev/null; do
+          sleep 5
+        done
+        kill -TERM "\$ddns" "\$web" 2>/dev/null || true
+        wait || true
+        exit 1
+        SH
+
+        # A compose file checked out with CRLF line endings would otherwise hand
+        # the container a script whose lines end in a carriage return, which
+        # no shell can parse. Stripping trailing whitespace removes them.
+        RUN sed -i "s/[[:space:]]*\$//" /entrypoint.sh /etc/nginx/conf.d/healthz.conf
+        ENTRYPOINT ["/entrypoint.sh"]
+    restart: unless-stopped
+    ports:
+      - 80:80
+      - 443:443
+    environment:
+      # Required. Needs Zone:Read and DNS:Edit on the zones below.
+      CF_API_TOKEN: ${CF_API_TOKEN:?set CF_API_TOKEN in .env}
+      # Comma separated record names. Leave empty to have cf-ddns list what the
+      # token can see into /data/config.json instead of updating anything.
+      CF_DDNS_RECORDS: ${CF_DDNS_RECORDS:-}
+      # A for IPv4, AAAA for IPv6. A container usually has no IPv6 route, so
+      # AAAA here needs IPv6 enabled on the daemon and on the network.
+      CF_DDNS_TYPE: ${CF_DDNS_TYPE:-A}
+      CF_DDNS_PROXIED: ${CF_DDNS_PROXIED:-false}
+      CF_DDNS_INTERVAL: ${CF_DDNS_INTERVAL:-300}
+      CF_DDNS_VERBOSE: ${CF_DDNS_VERBOSE:-false}
+    volumes:
+      # config.json lives here because cf-ddns writes to it. Losing this volume
+      # only costs the generated config, which is rebuilt from the environment.
+      - cf-ddns-data:/data
+      # Your site. Drop the line if you build the content into the image.
+      - ./html:/usr/share/nginx/html:ro
+    healthcheck:
+      # Covers both halves: nginx has to answer, and the updater has to still
+      # be running. Either one dying makes the container unhealthy.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null && pgrep -x cf-ddns >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  cf-ddns-data:

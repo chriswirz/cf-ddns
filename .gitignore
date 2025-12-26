@@ -1,0 +1,7 @@
+/cf-ddns
+/cf-ddns.exe
+/dist/
+/config.json
+*.log
+*.exe
+*.exe~

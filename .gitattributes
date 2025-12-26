@@ -1,0 +1,8 @@
+# Keep shell scripts, unit files and packaging LF so they work when checked out
+# on Windows and shipped to Linux/macOS.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+*.syso binary

@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  # A tag pushed by hand still releases, which is the escape hatch when a
+  # release is needed off the normal path.
+  push:
+    tags:
+      - 'v*'
+  # Called by ci.yml once every check on main has passed. A tag pushed with
+  # GITHUB_TOKEN deliberately does not start another workflow, so the
+  # automated path cannot rely on the trigger above and calls this instead.
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag to release.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: Binaries and archives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # When called, the caller's ref is a branch, so check out the tag it
+          # just pushed: GoReleaser takes the version from the checked out tag.
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-packages:
+    name: Linux packages (.deb/.rpm)
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+
+      # The published binary rather than "go install ...@latest". Building it
+      # tied this job to whatever Go version nfpm's own go.mod happens to
+      # require, and that is how it broke: nfpm started needing Go 1.26 while
+      # this job pins 1.25, so an unrelated commit failed to package. The
+      # release is pinned for the same reason golangci-lint is, and verified
+      # against the checksums the project publishes beside it.
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.47.0
+        run: |
+          set -euo pipefail
+          base="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}"
+          asset="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          tmp=$(mktemp -d)
+          curl -fsSL -o "$tmp/$asset" "$base/$asset"
+          curl -fsSL -o "$tmp/checksums.txt" "$base/checksums.txt"
+          want=$(awk -v a="$asset" '$NF == a || $NF == "*" a { print $1; exit }' "$tmp/checksums.txt")
+          got=$(sha256sum "$tmp/$asset" | awk '{print $1}')
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            echo "checksum mismatch for $asset: expected ${want:-<not listed>}, got $got" >&2
+            exit 1
+          fi
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$tmp/$asset" -C "$HOME/.local/bin" nfpm
+          chmod +x "$HOME/.local/bin/nfpm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/nfpm" --version
+
+      - name: Build linux binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          version="${TAG#v}"
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${version} -X main.commit=${GITHUB_SHA} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o packaging/cf-ddns ./cmd/cf-ddns
+          chmod +x packaging/cf-ddns
+
+      - name: Build .deb and .rpm
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          # deb and rpm both require a numeric version; strip the leading "v".
+          export PKG_VERSION="${TAG#v}"
+          mkdir -p out
+          nfpm package -f packaging/nfpm.yaml -p deb -t out/
+          nfpm package -f packaging/nfpm.yaml -p rpm -t out/
+          ls -l out
+
+      - name: Upload packages to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${TAG}" out/* --clobber
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cf-ddns-packages-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error

@@ -1,0 +1,19 @@
+name: Dependency Review
+
+on:
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    # Same story as code scanning: dependency review needs the dependency
+    # graph, which a private repository only gets with GitHub Advanced
+    # Security. This starts working on its own once the repository is public.
+    if: github.event.repository.private != true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5

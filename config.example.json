@@ -1,0 +1,23 @@
+{
+  "// api_token": "Cloudflare API token with Zone:Read and DNS:Edit on the zones below.",
+  "// api_token_env": "Leave empty here and set CF_API_TOKEN instead to keep the secret out of the file.",
+  "api_token": "",
+
+  "// interval_seconds": "How often to check the public IP. Minimum 30, default 300.",
+  "interval_seconds": 300,
+
+  "// log_file": "Optional, off by default: output goes to the console. Set a path to also append there. Relative paths resolve next to this config file.",
+  "log_file": "",
+
+  "// verbose": "Log every check, not just changes. Same as passing --verbose.",
+  "verbose": false,
+
+  "// records": "Leave this empty and run cf-ddns to have it fill in a possible_records section listing every A/AAAA record your token can see.",
+  "// records_ipv6": "type is A (IPv4) or AAAA (IPv6), default A. List a name twice, once of each, to keep both up to date.",
+  "records": [
+    { "name": "home.example.com" },
+    { "name": "vpn.example.com", "ttl": 60, "proxied": false },
+    { "name": "www.example.com", "zone": "example.com", "proxied": true },
+    { "name": "home.example.com", "type": "AAAA", "create": true }
+  ]
+}

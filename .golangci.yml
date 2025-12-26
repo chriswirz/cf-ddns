@@ -1,0 +1,18 @@
+# golangci-lint configuration. The version key is required by golangci-lint v2.
+# CI pins the linter version in .github/workflows/lint.yml; keep the two in step.
+version: "2"
+
+linters:
+  # The default set (errcheck, govet, ineffassign, staticcheck, unused) is the
+  # right level for a project this size. Nothing is added or removed.
+  default: standard
+
+  exclusions:
+    rules:
+      # In tests, the unchecked calls are stub HTTP handlers writing a canned
+      # response and decoders reading a body the test itself just wrote.
+      # Checking them adds noise without catching anything: if the stub is
+      # broken, the assertion that follows fails and says so.
+      - path: '_test\.go'
+        linters:
+          - errcheck

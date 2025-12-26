@@ -1,0 +1,37 @@
+# systemd unit. Install to /etc/systemd/system/cf-ddns.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cf-ddns
+[Unit]
+Description=cf-ddns - keep Cloudflare DNS records on the current public IP
+Documentation=https://github.com/chriswirz/cf-ddns
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cf-ddns
+Group=cf-ddns
+# Keep the API token out of the config file and world-readable process args.
+# EnvironmentFile should be root-owned mode 0600 and contain: CF_API_TOKEN=...
+EnvironmentFile=-/etc/cf-ddns/cf-ddns.env
+ExecStart=/usr/bin/cf-ddns --config /etc/cf-ddns/config.json
+Restart=always
+RestartSec=30
+
+# Hardening.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# The tool writes to its config directory: a discovery run adds a
+# possible_records section, and log_file lives there too.
+ReadWritePaths=/etc/cf-ddns
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
